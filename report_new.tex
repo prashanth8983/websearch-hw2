@@ -1,0 +1,1376 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{times}
+
+% LaTeX document geometry
+\geometry{
+    a4paper,
+    total={170mm,257mm},
+    left=20mm,
+    top=20mm,
+}
+
+% Hyperlink colors
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+}
+
+% Code listing style definition
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{cppstyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2,
+    language=C++
+}
+\lstset{style=cppstyle}
+
+% Title, Author, and Date
+\title{\textbf{Building a High-Performance Search Engine from Scratch \\ \large A C++ Implementation of a Block-Based Inverted Index and Query Processor}}
+\author{Prashanth Kumar (pk3047) \\ Pranav Joshi (pj2490)}
+\date{October 17, 2025}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report provides a comprehensive technical overview of a complete information retrieval system built in C++. The system is designed to handle large text collections by constructing a compressed, block-based inverted index, which it then uses to process user queries efficiently. The project is divided into three core components: an indexer that uses the Sort-based Partial Index Memory Inversion (SPIMI) algorithm, a merger that combines partial indexes into a final, compressed structure, and a query processor that ranks documents using the Okapi BM25 algorithm. This document details the architecture, data structures, algorithms, and implementation of each component.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+\section{System Architecture and Overview}
+
+\subsection{Introduction}
+The goal of this project is to implement a complete, text-based search engine. The core challenge in any search engine is to quickly find the set of documents relevant to a user's query from a potentially vast collection. A linear scan through every document for every query is computationally infeasible. The standard solution, and the one implemented here, is an \textbf{inverted index}. An inverted index is a data structure that maps terms (words) to the list of documents in which they appear. This "inverts" the traditional structure of documents containing terms. By pre-processing the collection to build this index, we can answer queries by looking up term lists and performing efficient set operations (intersections or unions) on them.
+
+This project implements the entire pipeline:
+\begin{enumerate}
+    \item \textbf{Indexing:} Reading a large collection of documents and creating a globally sorted, compressed inverted index.
+    \item \textbf{Querying:} Parsing user queries, retrieving relevant document lists from the index, and ranking them by relevance.
+\end{enumerate}
+
+\subsection{The Indexing Workflow: SPIMI}
+When the document collection is too large to fit into RAM, we cannot build the entire index in memory at once. To solve this, we employ the \textbf{Sort-based Partial Index Memory Inversion (SPIMI)} algorithm. This is a two-phase process that allows us to build an index of arbitrary size using a fixed amount of memory.
+
+\subsubsection{Phase 1: The Indexer}
+The indexer reads the document collection sequentially and creates multiple, smaller, sorted index files called \textbf{runs}.
+\begin{enumerate}
+    \item A fixed-size memory buffer is allocated.
+    \item Documents are read one by one. For each document, we extract (term, docID, frequency) tuples.
+    \item These tuples are added to the buffer.
+    \item When the buffer becomes full, its contents are sorted alphabetically by term, and then numerically by docID.
+    \item The entire sorted buffer is written to a temporary file on disk (a "run").
+    \item The buffer is cleared, and the process repeats until all documents have been processed.
+\end{enumerate}
+
+\subsubsection{Phase 2: The Merger}
+After the indexer has finished, the disk contains multiple sorted runs. The merger's job is to combine these runs into a single, final inverted index. This is accomplished using a \textbf{k-way merge} algorithm, where 'k' is the number of runs.
+\begin{enumerate}
+    \item The first posting from each of the 'k' run files is read into memory.
+    \item A priority queue (min-heap) is used to efficiently find the globally smallest posting (by term, then docID).
+    \item The smallest posting is popped from the queue and processed.
+    \item The next posting from the file that the popped posting came from is read and added to the queue.
+    \item This process continues, effectively merging all sorted runs in a single pass.
+\end{enumerate}
+
+\subsection{Index Structure and Compression}
+The final inverted index is not just a simple list. To ensure high performance and a small footprint, several optimizations are used.
+
+\subsubsection{Block-Based Structure}
+A term's postings list can be very long. To avoid decompressing a multi-megabyte list for a single lookup, we partition each list into fixed-size \textbf{blocks} (128 postings per block). This allows the query processor to fetch and decompress only the specific blocks it needs, which is especially critical for skipping irrelevant parts of the list during conjunctive query processing.
+
+\subsubsection{Final Index Components}
+The final, queryable index consists of several files working in concert:
+\begin{itemize}
+    \item \texttt{inverted\_index.bin}: This is the main data file containing all the postings lists. The data is compressed using Delta and Var-Byte encoding and organized into blocks. It is a binary file designed for sequential access driven by pointers from the lexicon and metadata.
+
+    \item \texttt{lexicon.txt}: A human-readable text file that acts as the primary dictionary for the search engine. Each line corresponds to a unique term in the collection and has the following tab-separated format:
+    
+    \texttt{term  start\_offset  start\_block  total\_postings  doc\_frequency}
+    
+    \begin{itemize}
+        \item \textbf{term}: The word itself.
+        \item \textbf{start\_offset}: The byte offset in \texttt{inverted\_index.bin} where the first block for this term's postings list begins.
+        \item \textbf{start\_block}: The global index of the first block for this term. This is used to index into the metadata arrays.
+        \item \textbf{total\_postings}: The total number of documents this term appears in (i.e., the length of its postings list).
+        \item \textbf{doc\_frequency (DF)}: The number of documents containing the term. This is crucial for calculating the Inverse Document Frequency (IDF) part of the BM25 score.
+    \end{itemize}
+
+    \item \texttt{metadata.bin}: A binary file containing block-level metadata that enables efficient skipping. It stores three parallel arrays, all indexed by a global block ID:
+    \begin{itemize}
+        \item \textbf{lastDocIDs}: An array of integers. \texttt{lastDocIDs[i]} stores the docID of the last posting in block \texttt{i}. The query processor uses this to determine if a target docID could possibly be in a block without having to decompress it.
+        \item \textbf{docIDSizes}: An array of integers storing the size in bytes of the compressed docID data for each block.
+        \item \textbf{freqSizes}: An array of integers storing the size in bytes of the compressed frequency data for each block.
+    \end{itemize}
+
+    \item \texttt{doc\_lengths.txt}: A simple text file that stores the length (number of tokens) of each document. Each line has the format \texttt{docID length}. This information is essential for the BM25 ranking formula, which normalizes term frequency by document length.
+\end{itemize}
+
+
+\subsubsection{Compression Techniques}
+\begin{itemize}
+    \item \textbf{Delta Encoding}: Since docIDs in a postings list are sorted and monotonically increasing, we can store the \textit{gaps} between them instead of the absolute values. For example, a list of docIDs `[100, 105, 112, 121]` becomes `[100, 5, 7, 9]`. This results in a set of much smaller integers, which are more amenable to compression.
+
+    \item \textbf{Variable-Byte (Var-Byte) Encoding}: This is a technique to encode integers using a variable number of bytes. Smaller integers use fewer bytes. It works by using 7 bits of each byte for data and the 8th bit (the most significant bit) as a "continuation bit". 
+    \begin{itemize}
+        \item If the continuation bit is 1, it signals that the next byte is part of the same number.
+        \item If the continuation bit is 0, it signals the end of the number.
+    \end{itemize}
+    \textbf{Encoding Example}: To encode the number `300`:
+    \begin{enumerate}
+        \item In binary, $300 = 100101100_2$.
+        \item The first byte takes the lowest 7 bits: $0101100_2$. The number is larger than 127, so we set the continuation bit to 1: `10101100`.
+        \item We shift the number right by 7 bits: $10_2$.
+        \item This remaining value fits in 7 bits. We set its continuation bit to 0 to mark it as the last byte: `00000010`.
+        \item The final encoded sequence (in order) is `10101100 00000010`.
+    \end{enumerate}
+    \textbf{Decoding Example}: To decode `10101100 00000010`:
+    \begin{enumerate}
+        \item Read the first byte `10101100`. The continuation bit is 1. The data is `0101100`.
+        \item Read the second byte `00000010`. The continuation bit is 0. The data is `0000010`.
+        \item Reconstruct the number: `(0000010 << 7) | 0101100` = `10000000 | 0101100` = `100101100`, which is 300.
+    \end{enumerate}
+\end{itemize}
+
+\subsection{Query Processing and Ranking}
+The query processor uses the generated index to find and rank documents.
+\begin{itemize}
+    \item \textbf{Disjunctive (OR) Queries:} Retrieve all documents containing \textit{any} of the query terms and sum their relevance scores.
+    \item \textbf{Conjunctive (AND) Queries:} Retrieve only the documents containing \textit{all} of the query terms. This is done with an efficient document-at-a-time intersection algorithm using a `nextGEQ()` function that leverages the index's block structure to skip irrelevant postings.
+    \item \textbf{Ranking with Okapi BM25:} The relevance of a document to a query is not binary. The \textbf{Okapi BM25} formula is a state-of-the-art ranking function that scores documents based on term frequency (how often a term appears in a document), inverse document frequency (how rare the term is across the entire collection), and document length.
+\end{itemize}
+
+\subsection{System Workflow Diagram}
+The following diagram illustrates the complete data flow, from raw documents to the final, queryable index files.
+\begin{verbatim}
++-------------------+
+|  collection.tsv   |
+| (Raw Document Data) |
++-------------------+
+         V
++-------------------+
+|    indexer.cpp    |
++-------------------+
+         V
++-------------------+
+| run_0.bin ...     |
+| run_N.bin         |
++-------------------+
+         V
++-------------------+
+|    merger.cpp     |
++-------------------+
+         V
++--------------------------+
+| inverted_index.bin       |
+| lexicon.txt              |
+| metadata.bin             |
+| doc_lengths.txt          |
++--------------------------+
+       (Used by...)
+         V
++-------------------+
+|     query.cpp     |
++-------------------+
+\end{verbatim}
+
+
+\section{Phase 1: The Indexer}
+
+\subsection{Purpose and Algorithm}
+The indexer is the first stage of the pipeline, responsible for processing the raw text collection and preparing it for the final merge. As outlined in the previous chapter, it implements the in-memory portion of the SPIMI algorithm. Its sole responsibility is to produce multiple, independently sorted runs of postings. This approach effectively trades I/O operations for memory, allowing a machine with limited RAM to index a collection of nearly infinite size. The logic revolves around a simple loop: read, tokenize, buffer, and flush. The flush step is the most critical, as it involves an in-memory sort of millions of postings, which must be highly efficient. The standard library's `std::sort` is more than capable for this task, as it is typically a highly optimized introspective sort.
+
+\subsection{Key Data Structures}
+\begin{itemize}
+    \item \texttt{vector<tuple<string, int, int>> postingBuffer}: The main in-memory buffer. A tuple is used to store the term, its associated docID, and its frequency within that document. The default sorting behavior of `std::tuple` is lexicographical, which is exactly what we need: it sorts by term first, then by docID.
+    \item \texttt{unordered\_map<string, int> termFreq}: A temporary hash map used to count term frequencies for a \textit{single} document. This is rebuilt for every document to ensure counts do not spill over.
+\end{itemize}
+
+\subsection{Code Explanation}
+\begin{itemize}
+    \item \textbf{tokenize()}: A straightforward function that iterates through a string, collecting sequences of alphanumeric characters. It converts all characters to lowercase for normalization, ensuring that "Apple" and "apple" are treated as the same term.
+    \item \textbf{write\_file()}: This function takes the sorted buffer and writes it to a binary file. Writing in binary is much more efficient and compact than writing text. For each posting, it writes the term's length, the term itself, the docID, and the frequency.
+    \item \textbf{main()}: The main function orchestrates the process. It initializes file streams for document metadata (\texttt{page\_table.txt}, \texttt{doc\_lengths.txt}, etc.). It then enters a loop, reading the input TSV file line by line. Inside the loop, it tokenizes the document, calculates term frequencies, and adds the resulting postings to the \texttt{postingBuffer}. When the buffer hits the \texttt{MAX\_BUFFER\_SIZE} threshold, it's sorted and flushed to disk via \texttt{write\_file()}. A final flush handles any remaining postings after the last document is read. Finally, it writes some metadata about the indexing process for the merger to use.
+\end{itemize}
+
+\section{Phase 2: The Merger}
+\subsection{Purpose and Algorithm}
+The merger's task is to take the many sorted \texttt{run\_X.bin} files from the indexer and combine them into a single, final inverted index. It must do this efficiently, without ever loading the full content of all runs into memory. The chosen algorithm is a \textbf{k-way merge}. A priority queue (min-heap) is the perfect data structure for this.
+\begin{enumerate}
+    \item Read the first posting from each of the k runs and insert them into the priority queue. The queue is ordered by term, then by docID.
+    \item In a loop, extract the minimum element from the priority queue. This element is the next posting in the globally sorted order.
+    \item Process this posting by adding it to the postings list for the current term being built.
+    \item Read the next posting from the same run file the extracted element came from and add it to the priority queue.
+    \item When the term changes (e.g., all postings for "apple" have been processed and the next one is for "banana"), the complete postings list for "apple" is compressed and written to the final inverted index file. A corresponding entry is written to the lexicon file.
+\end{enumerate}
+
+\subsection{Compression and Performance Statistics}
+The merger is responsible for the final compression and output. The combination of Delta and Var-Byte encoding significantly reduces the on-disk size of the index. Below are hypothetical statistics from indexing a 10 GB collection of 8 million documents.
+
+\begin{table}[h!]
+\centering
+\caption{Hypothetical Index Compression Statistics}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Component} & \textbf{Size} \\ \hline
+Raw Text Collection (\texttt{.tsv}) & 10.2 GB \\ \hline
+Total Size of Partial Runs (\texttt{run\_*.bin}) & 14.5 GB \\ \hline
+Final Compressed Inverted Index (\texttt{inverted\_index.bin}) & \textbf{2.8 GB} \\ \hline
+Lexicon File (\texttt{lexicon.txt}) & 150 MB \\ \hline
+Block Metadata (\texttt{metadata.bin}) & 45 MB \\ \hline
+Document Lengths (\texttt{doc\_lengths.txt}) & 90 MB \\ \hline
+\textbf{Total On-Disk Size (Final Index)} & \textbf{3.085 GB} \\ \hline
+\end{tabular}
+\label{tab:stats}
+\end{table}
+
+As shown in Table \ref{tab:stats}, the final compressed index is over 3x smaller than the original text collection. The lexicon and metadata files, which are loaded into memory by the query processor, have a combined size of 195 MB, which is a manageable memory footprint for real-time querying.
+
+\subsection{Code Explanation}
+\begin{itemize}
+    \item \textbf{TermEntry}: A simple struct to hold a posting and the index of the run file it came from. The overloaded `>` operator is essential for the min-heap behavior of the priority queue.
+    \item \textbf{varbyte\_encode()}: Implements Var-Byte encoding. It takes an integer and pushes one or more bytes into an output vector, setting the continuation bit on all but the last byte.
+    \item \textbf{write\_block()}: This function handles the compression and writing of a single block of 128 postings. It performs delta encoding, then Var-Byte encoding, and writes the compressed byte streams to the inverted index file. It also records the block's metadata (last docID, byte sizes) in vectors that will be written to `metadata.bin` at the end.
+    \item \textbf{read\_next()}: A helper function to read one posting record from a binary run file.
+    \item \textbf{main()}: The main merging logic. It initializes the priority queue by reading the first posting from all run files. The main `while (!pq.empty())` loop drives the process. It continually pulls the smallest posting, processes it, and refills the queue. The logic to detect a change in `currentTerm` is the trigger to finalize the previous term's postings list and write its entry to the lexicon. Finally, it writes out all the collected block metadata to `metadata.bin`.
+\end{itemize}
+
+
+\section{Phase 3: The Query Processor}
+\subsection{Purpose and Algorithm}
+The query processor is the user-facing component of the search engine. It takes the pre-built index and uses it to answer user queries in real-time. It is responsible for parsing queries, efficiently retrieving postings from the index, and ranking the resulting documents by relevance.
+
+\subsubsection{The InvertedList Class}
+This class is the heart of the query processor. It provides an abstraction for iterating over a term's postings list without loading the entire list into memory. It reads and decompresses one block at a time, as needed. Its most powerful method is \texttt{nextGEQ(targetDocID)} (Next Greater Than or Equal To). This method is the key to efficient conjunctive query processing. It intelligently uses the \texttt{lastDocIDs} metadata loaded from \texttt{metadata.bin} to skip over entire blocks of postings that cannot possibly contain the \texttt{targetDocID}, dramatically reducing I/O and decompression overhead.
+
+\subsubsection{Ranking with Okapi BM25}
+To rank documents, the system uses the Okapi BM25 formula. The formula for a single query term is:
+\begin{equation}
+\label{eq:bm25}
+\text{score}(D,q) = \text{IDF}(q) \cdot \frac{f(q,D) \cdot (k_{1}+1)}{f(q,D) + k_{1} \cdot (1 - b + b \cdot \frac{|D|}{\text{avgdl}})}
+\end{equation}
+Where:
+\begin{itemize}
+    \item $f(q,D)$ is the term frequency of term $q$ in document D.
+    \item $|D|$ is the length of document D.
+    \item avgdl is the average document length in the collection.
+    \item $k_{1}$ and $b$ are free parameters, chosen as $k_1=1.2$ and $b=0.75$.
+    \item $\text{IDF}(q)$ is the Inverse Document Frequency of the term, calculated as:
+\end{itemize}
+\begin{equation}
+\label{eq:idf}
+\text{IDF}(q) = \log\left(\frac{N - n(q) + 0.5}{n(q) + 0.5}\right)
+\end{equation}
+Where N is the total number of documents and $n(q)$ is the number of documents containing term q. The total score for a document is the sum of the individual BM25 scores for each query term.
+
+\subsection{Query Performance and Analysis}
+Query processing time depends heavily on the query type (AND vs. OR) and the document frequency of the terms. Conjunctive (AND) queries are typically much faster, especially with rare terms, because the `nextGEQ` algorithm can skip large portions of the postings lists. Disjunctive (OR) queries must process the full postings list for every term.
+
+\begin{table}[h!]
+\centering
+\caption{Hypothetical Query Performance Statistics}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Query} & \textbf{Type} & \textbf{Results} & \textbf{Time (ms)} \\ \hline
+"information retrieval" & OR & 350,120 & 45.8 ms \\ \hline
+"information retrieval" & AND & 25,340 & \textbf{8.2 ms} \\ \hline
+"spimi algorithm" & AND & 150 & \textbf{1.5 ms} \\ \hline
+"the" & OR & 7,890,100 & 180.2 ms \\ \hline
+\end{tabular}
+\label{tab:query_perf}
+\end{table}
+
+Table \ref{tab:query_perf} shows sample performance. The AND query for "information retrieval" is over 5x faster than the OR version. The query for "spimi algorithm" is extremely fast because these are relatively rare terms, allowing for very efficient intersection. In contrast, a disjunctive query for a common stop word like "the" requires iterating over millions of postings and is consequently much slower.
+
+\subsection{Code Explanation}
+\begin{itemize}
+    \item \textbf{loadIndex()}: This function runs once at startup. It reads the lexicon, document lengths, and block metadata into global in-memory maps and vectors for fast access during query time.
+    \item \textbf{varbyte\_decode()}: The inverse of the encoder in the merger. It reads a stream of bytes and reconstructs the original integer.
+    \item \textbf{InvertedList::decompressBlock()}: This private method handles the on-demand reading and decompression of a single block from the \texttt{inverted\_index.bin} file. It reads the Var-Byte encoded data, decodes it, and reconstructs the absolute docIDs from the deltas.
+    \item \textbf{processDisjunctiveQuery()}: Implements OR query logic. It iterates through each query term, retrieves its full postings list using the \texttt{InvertedList} class, calculates the BM25 score for each document in the list, and accumulates the scores in a hash map.
+    \item \textbf{processConjunctiveQuery()}: Implements AND query logic. It opens an \texttt{InvertedList} for each query term and uses a document-at-a-time approach. It sorts the lists by term frequency and uses the docID from the shortest list as a "pivot". It then calls \texttt{nextGEQ()} on all other lists to efficiently seek to that pivot. If all lists contain the same docID, it is a match, and its score is calculated.
+    \item \textbf{main()}: Provides two modes: an interactive command-line interface and a multi-threaded web server using the `crow` library. It loads the index, accepts queries, determines the query type (AND/OR), calls the appropriate processing function, and returns the top ranked results.
+\end{itemize}
+
+\section{Conclusion}
+This project successfully demonstrates the end-to-end construction of a modern search engine. By implementing the SPIMI algorithm, the system is capable of indexing document collections that far exceed available system memory. The use of a k-way merge, combined with delta and Var-Byte compression, produces a final index that is both compact and structured for high-performance retrieval. The query processor leverages this structure, particularly through block-skipping, to answer conjunctive and disjunctive queries efficiently, ranking results with the industry-standard BM25 algorithm. While this implementation forms a strong foundation, future work could include adding support for phrase queries, implementing more advanced text normalization (stemming and stop-word removal), and distributing the index across multiple machines for even greater scalability.
+
+\newpage
+\appendix
+\section{Source Code: indexer.cpp}
+\begin{lstlisting}[caption={The complete source code for the indexer component.}, label={lst:indexer}]
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <cctype>
+#include <algorithm>
+#include <vector>
+#include <unordered_map>
+#include <cstdlib>
+#include <cwctype>
+#include <locale>
+
+using namespace std;
+
+//Tokenize sentences into terms
+vector<string> tokenize(const string& s) {
+    vector<string> tokens;
+    string token;
+    for (char c : s) {
+        if (isalnum(c)) {
+            token += tolower(c);
+        } else if (!token.empty()) {
+            tokens.push_back(token);
+            token.clear();
+        }
+    }
+    if (!token.empty()) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+// Write sorted postings to a binary run file
+void write_file(const vector<tuple<string, int, int>>& postings, int runNumber) {
+    string filename = "partial/run_" + to_string(runNumber) + ".bin";
+    ofstream out(filename, ios::binary);
+    
+    for (const auto& [term, docID, freq] : postings) {
+        // Write term length and term
+        int termLen = term.size();
+        out.write(reinterpret_cast<const char*>(&termLen), sizeof(int));
+        out.write(term.data(), termLen);
+        
+        // Write docID and freq
+        out.write(reinterpret_cast<const char*>(&docID), sizeof(int));
+        out.write(reinterpret_cast<const char*>(&freq), sizeof(int));
+    }
+    
+    out.close();
+    
+    cerr << "Saved partial index: run_" << runNumber << ".bin ("<< postings.size() << " postings)\n";
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        cerr << "Usage: " << argv[0] << " <input_file.tsv>\n";
+        return 1;
+    }
+
+    string inputFilename = argv[1];
+    ifstream file(inputFilename);
+    if (!file.is_open()) {
+        cerr << "Error: Cannot open file '" << inputFilename << "'\n";
+        return 1;
+    }
+
+    // Buffer for postings
+    vector<tuple<string, int, int>> postingBuffer;
+    const size_t MAX_BUFFER_SIZE = 10000000;
+    
+    int docID = 0;
+    int runNumber = 0;
+    string line;
+    
+    // Document metadata
+    ofstream pageTable("index/page_table.txt");
+    ofstream docLengthFile("index/doc_lengths.txt");
+
+    ofstream docStoreFile("index/documents.dat", ios::binary);
+    ofstream docStoreIndexFile("index/documents.idx", ios::binary);
+
+    cerr << "Starting indexing...\n";
+
+    while (getline(file, line)) {
+        stringstream ss(line);
+        string pid_str, passage;
+        
+        if (!getline(ss, pid_str, '\t')) continue;
+        if (!getline(ss, passage)) continue;
+
+        long long offset = docStoreFile.tellp();
+        int length = passage.length();
+        docStoreFile.write(passage.c_str(), length);
+        docStoreIndexFile.write(reinterpret_cast<const char*>(&offset), sizeof(long long));
+        docStoreIndexFile.write(reinterpret_cast<const char*>(&length), sizeof(int));
+
+        // Tokenize passage
+        vector<string> tokens = tokenize(passage);
+        if (tokens.empty()) continue;
+
+        // Write to page table
+        pageTable << docID << "\t" << pid_str << "\n";
+        
+        // Write document length
+        docLengthFile << docID << "\t" << tokens.size() << "\n";
+
+        // Count term frequencies
+        unordered_map<string, int> termFreq;
+        for (const auto& t : tokens) {
+            termFreq[t]++;
+        }
+
+        // Add postings to buffer
+        for (const auto& pair : termFreq) {
+            postingBuffer.push_back({pair.first, docID, pair.second});
+        }
+
+        docID++;
+
+        // Progress update every 100k documents
+        if (docID % 100000 == 0) {
+            cerr << "Indexed " << docID << " documents...\n";
+        }
+
+        // Flush buffer when full
+        if (postingBuffer.size() >= MAX_BUFFER_SIZE) {
+            sort(postingBuffer.begin(), postingBuffer.end());
+            write_file(postingBuffer, runNumber++);
+            postingBuffer.clear();
+        }
+    }
+
+    file.close();
+    pageTable.close();
+    docLengthFile.close();
+    docStoreFile.close();
+    docStoreIndexFile.close();
+   
+    if (!postingBuffer.empty()) {
+        sort(postingBuffer.begin(), postingBuffer.end());
+        write_file(postingBuffer, runNumber++);
+    }
+
+    // Write metadata
+    ofstream metaFile("index/indexer_meta.txt");
+    metaFile << "total_documents\t" << docID << "\n";
+    metaFile << "total_runs\t" << runNumber << "\n";
+    metaFile.close();
+
+    cerr << "\nIndexing complete!\n";
+    cerr << "Total documents: " << docID << "\n";
+    cerr << "Total runs: " << runNumber << "\n";
+
+    return 0;
+}
+\end{lstlisting}
+
+\section{Source Code: merger.cpp}
+\begin{lstlisting}[caption={The complete source code for the merger component.}, label={lst:merger}]
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <queue>
+#include <algorithm>
+#include <unordered_map>
+
+using namespace std;
+
+const int BLOCK_SIZE = 128;
+
+struct TermEntry {
+    string term;
+    int docID;
+    int freq;
+    int fileIndex;
+    
+    bool operator>(const TermEntry& other) const {
+        if (term != other.term) return term > other.term;
+        return docID > other.docID;
+    }
+};
+
+void varbyte_encode(int num, vector<unsigned char>& output) {
+    while (num >= 128) {
+        output.push_back((num & 0x7F) | 0x80);
+        num >>= 7;
+    }
+    output.push_back(num & 0x7F);
+}
+
+void write_block(ofstream& invFile, const vector<int>& docIDs, const vector<int>& freqs,vector<int>& lastDocIDs, vector<int>& docIDSizes, vector<int>& freqSizes) {
+    
+    // Delta encode docIDs
+    vector<int> deltas;
+    deltas.push_back(docIDs[0]);
+    for (size_t i = 1; i < docIDs.size(); i++) {
+        deltas.push_back(docIDs[i] - docIDs[i-1]);
+    }
+    
+    // Varbyte encode
+    vector<unsigned char> encodedDocIDs, encodedFreqs;
+    for (int delta : deltas) {
+        varbyte_encode(delta, encodedDocIDs);
+    }
+    for (int freq : freqs) {
+        varbyte_encode(freq, encodedFreqs);
+    }
+    
+    // Write blocks
+    int docIDSize = encodedDocIDs.size();
+    invFile.write(reinterpret_cast<const char*>(&docIDSize), sizeof(int));
+    invFile.write(reinterpret_cast<const char*>(encodedDocIDs.data()), docIDSize);
+    
+    int freqSize = encodedFreqs.size();
+    invFile.write(reinterpret_cast<const char*>(&freqSize), sizeof(int));
+    invFile.write(reinterpret_cast<const char*>(encodedFreqs.data()), freqSize);
+    
+    // Store metadata
+    lastDocIDs.push_back(docIDs.back());
+    docIDSizes.push_back(docIDSize);
+    freqSizes.push_back(freqSize);
+}
+
+// Read next items from binary run file
+bool read_next(ifstream& file, string& term, int& docID, int& freq) {
+    // Read term length
+    int termLen;
+    if (!file.read(reinterpret_cast<char*>(&termLen), sizeof(int))) {
+        return false;
+    }
+    
+    // Read term
+    term.resize(termLen);
+    file.read(&term[0], termLen);
+    
+    // Read docID and freq
+    file.read(reinterpret_cast<char*>(&docID), sizeof(int));
+    file.read(reinterpret_cast<char*>(&freq), sizeof(int));
+    
+    return true;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        cerr << "Usage: " << argv[0] << " <num_runs>\n";
+        return 1;
+    }
+    
+    int numRuns = stoi(argv[1]);
+    
+    // Open all run files
+    vector<ifstream> runFiles(numRuns);
+    for (int i = 0; i < numRuns; i++) {
+        string filename = "partial/run_" + to_string(i) + ".bin";
+        runFiles[i].open(filename, ios::binary);
+        if (!runFiles[i].is_open()) {
+            cerr << "Error: Cannot open " << filename << "\n";
+            return 1;
+        }
+    }
+    
+    // Open output files
+    ofstream invFile("index/inverted_index.bin", ios::binary);
+    ofstream lexFile("index/lexicon.txt");
+    
+    if (!invFile.is_open() || !lexFile.is_open()) {
+        cerr << "Error: Cannot create output files\n";
+        return 1;
+    }
+    
+    // Min heap - Priority queue for k-way merge
+    priority_queue<TermEntry, vector<TermEntry>, greater<TermEntry>> pq;
+    
+    // Initialize
+    vector<string> currentTerms(numRuns);
+    vector<int> currentDocIDs(numRuns);
+    vector<int> currentFreqs(numRuns);
+    
+    for (int i = 0; i < numRuns; i++) {
+        if (read_next(runFiles[i], currentTerms[i], currentDocIDs[i], currentFreqs[i])) {
+            pq.push({currentTerms[i], currentDocIDs[i], currentFreqs[i], i});
+        }
+    }
+    
+    // Metadata arrays
+    vector<int> allLastDocIDs, allDocIDSizes, allFreqSizes;
+    
+    // Statistics
+    int termsProcessed = 0;
+    long long totalPostings = 0;
+    unordered_map<string, int> termDF;
+    
+    // Current term
+    string currentTerm = "";
+    vector<int> termDocIDs, termFreqs;
+    long long termStartOffset = 0;
+    int termStartBlock = 0;
+    
+    while (!pq.empty()) {
+        TermEntry entry = pq.top();
+        pq.pop();
+        
+        // New term - finish previous
+        if (!currentTerm.empty() && entry.term != currentTerm) {
+            if (!termDocIDs.empty()) {
+                write_block(invFile, termDocIDs, termFreqs, 
+                          allLastDocIDs, allDocIDSizes, allFreqSizes);
+            }
+            
+            // Write lexicon entry
+            lexFile << currentTerm << "\t" 
+                    << termStartOffset << "\t"
+                    << termStartBlock << "\t"
+                    << totalPostings << "\t"
+                    << termDF[currentTerm] << "\n";
+            
+            termDocIDs.clear();
+            termFreqs.clear();
+            termStartOffset = invFile.tellp();
+            termStartBlock = allLastDocIDs.size();
+            termsProcessed++;
+            
+            if (termsProcessed % 50000 == 0) {
+                cerr << "Merged " << termsProcessed << " terms\r" << flush;
+            }
+        }
+        
+        // Process current posting
+        if (entry.term != currentTerm) {
+            currentTerm = entry.term;
+            termDF[currentTerm] = 0;
+            totalPostings = 0;
+        }
+        
+        termDocIDs.push_back(entry.docID);
+        termFreqs.push_back(entry.freq);
+        termDF[currentTerm]++;
+        totalPostings++;
+        
+        // Write block when full
+        if ((int)termDocIDs.size() == BLOCK_SIZE) {
+            write_block(invFile, termDocIDs, termFreqs,
+                      allLastDocIDs, allDocIDSizes, allFreqSizes);
+            termDocIDs.clear();
+            termFreqs.clear();
+        }
+        
+        // Read next from same file
+        int fileIdx = entry.fileIndex;
+        if (read_next(runFiles[fileIdx], currentTerms[fileIdx], 
+                           currentDocIDs[fileIdx], currentFreqs[fileIdx])) {
+            pq.push({currentTerms[fileIdx], currentDocIDs[fileIdx], 
+                    currentFreqs[fileIdx], fileIdx});
+        }
+    }
+    
+    // Process last term
+    if (!currentTerm.empty()) {
+        if (!termDocIDs.empty()) {
+            write_block(invFile, termDocIDs, termFreqs,
+                      allLastDocIDs, allDocIDSizes, allFreqSizes);
+        }
+        
+        lexFile << currentTerm << "\t" 
+                << termStartOffset << "\t"
+                << termStartBlock << "\t"
+                << totalPostings << "\t"
+                << termDF[currentTerm] << "\n";
+        termsProcessed++;
+    }
+    
+    // Close files
+    for (auto& f : runFiles) f.close();
+    invFile.close();
+    lexFile.close();
+    
+    // Write metadata
+    ofstream metaFile("index/metadata.bin", ios::binary);
+    
+    int numBlocks = allLastDocIDs.size();
+    metaFile.write(reinterpret_cast<const char*>(&numBlocks), sizeof(int));
+    metaFile.write(reinterpret_cast<const char*>(allLastDocIDs.data()), numBlocks * sizeof(int));
+    metaFile.write(reinterpret_cast<const char*>(allDocIDSizes.data()), numBlocks * sizeof(int));
+    metaFile.write(reinterpret_cast<const char*>(allFreqSizes.data()),  numBlocks * sizeof(int));
+    metaFile.close();
+    
+    // Write stats
+    ofstream statsFile("index/collection_stats.txt");
+    statsFile << "total_terms\t" << termsProcessed << "\n";
+    statsFile << "total_blocks\t" << numBlocks << "\n";
+    statsFile.close();
+    
+    cerr << "\nMerge complete: " << termsProcessed << " terms, " << numBlocks << " blocks\n";
+    
+    return 0;
+}
+\end{lstlisting}
+
+\section{Source Code: query.cpp}
+\begin{lstlisting}[caption={The complete source code for the query processor component.}, label={lst:query}]
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <mutex>
+#include <chrono>
+#include <cstring>
+
+#include "crow.h"
+#include <crow/json.h>
+
+using namespace std;
+
+const double K1 = 1.2;
+const double B = 0.75;
+const int BLOCK_SIZE = 128;
+
+struct SearchResult {
+    int docID;
+    double score;
+    string snippet;
+};
+vector<pair<long long, int>> docStoreIndex;
+
+unordered_map<string, tuple<long long, int, int, int>> lexicon;
+vector<int> lastDocIDs, docIDSizes, freqSizes;
+unordered_map<int, int> docLengths;
+int totalDocuments = 0;
+double avgDocLength = 0.0;
+
+mutex fileMutex;
+
+// Varbyte decoding
+int varbyte_decode(const unsigned char* data, int& offset) {
+    int num = 0;
+    int shift = 0;
+    unsigned char byte;
+    
+    do {
+        byte = data[offset++];
+        num |= (byte & 0x7F) << shift;
+        shift += 7;
+    } while (byte & 0x80);
+    
+    return num;
+}
+
+// Tokenize query
+vector<string> tokenize(const string& s) {
+    vector<string> tokens;
+    string token;
+    for (char c : s) {
+        if (isalnum(c)) {
+            token += tolower(c);
+        } else if (!token.empty()) {
+            tokens.push_back(token);
+            token.clear();
+        }
+    }
+    if (!token.empty()) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+// Inverted List API
+class InvertedList {
+private:
+    ifstream* invFile;
+    string term;
+    long long startOffset;
+    int startBlock;
+    int numPostings;
+    
+    int currentBlockIdx;
+    vector<int> currentDocIDs;
+    vector<int> currentFreqs;
+    int positionInBlock;
+    bool finished;
+    
+    void decompressBlock(int blockIdx) {
+        currentDocIDs.clear();
+        currentFreqs.clear();
+        
+        if (blockIdx >= startBlock + (numPostings + BLOCK_SIZE - 1) / BLOCK_SIZE) {
+            finished = true;
+            return;
+        }
+        
+        long long offset = startOffset;
+        for (int i = startBlock; i < blockIdx; i++) {
+            offset += sizeof(int) + docIDSizes[i] + sizeof(int) + freqSizes[i];
+        }
+        
+        invFile->seekg(offset);
+        
+        int docIDSize;
+        invFile->read(reinterpret_cast<char*>(&docIDSize), sizeof(int));
+        vector<unsigned char> docIDBlock(docIDSize);
+        invFile->read(reinterpret_cast<char*>(docIDBlock.data()), docIDSize);
+        
+        int freqSize;
+        invFile->read(reinterpret_cast<char*>(&freqSize), sizeof(int));
+        vector<unsigned char> freqBlock(freqSize);
+        invFile->read(reinterpret_cast<char*>(freqBlock.data()), freqSize);
+        
+        int offset_docID = 0;
+        while (offset_docID < docIDSize) {
+            currentDocIDs.push_back(varbyte_decode(docIDBlock.data(), offset_docID));
+        }
+        
+        for (size_t i = 1; i < currentDocIDs.size(); i++) {
+            currentDocIDs[i] += currentDocIDs[i-1];
+        }
+        
+        int offset_freq = 0;
+        while (offset_freq < freqSize) {
+            currentFreqs.push_back(varbyte_decode(freqBlock.data(), offset_freq));
+        }
+        
+        positionInBlock = 0;
+    }
+    
+public:
+    InvertedList(ifstream* file, const string& t) 
+        : invFile(file), term(t), finished(false) {
+        
+        auto it = lexicon.find(term);
+        if (it == lexicon.end()) {
+            finished = true;
+            return;
+        }
+        
+        startOffset = get<0>(it->second);
+        startBlock = get<1>(it->second);
+        numPostings = get<2>(it->second);
+        
+        currentBlockIdx = startBlock;
+        decompressBlock(currentBlockIdx);
+    }
+    
+    bool nextGEQ(int targetDocID) {
+        if (finished) return false;
+        
+        while (currentBlockIdx < startBlock + (numPostings + BLOCK_SIZE - 1) / BLOCK_SIZE) {
+            if (lastDocIDs[currentBlockIdx] >= targetDocID) {
+                if (currentDocIDs.empty() || positionInBlock >= (int)currentDocIDs.size()) {
+                    decompressBlock(currentBlockIdx);
+                }
+                break;
+            }
+            currentBlockIdx++;
+        }
+        
+        if (finished) return false;
+        
+        while (positionInBlock < (int)currentDocIDs.size()) {
+            if (currentDocIDs[positionInBlock] >= targetDocID) {
+                return true;
+            }
+            positionInBlock++;
+        }
+        
+        currentBlockIdx++;
+        if (currentBlockIdx >= startBlock + (numPostings + BLOCK_SIZE - 1) / BLOCK_SIZE) {
+            finished = true;
+            return false;
+        }
+        
+        decompressBlock(currentBlockIdx);
+        return nextGEQ(targetDocID);
+    }
+    
+    bool hasNext() {
+        return !finished && positionInBlock < (int)currentDocIDs.size();
+    }
+    
+    int getDocID() {
+        if (!hasNext()) return -1;
+        return currentDocIDs[positionInBlock];
+    }
+    
+    int getFrequency() {
+        if (!hasNext()) return 0;
+        return currentFreqs[positionInBlock];
+    }
+    
+    void next() {
+        positionInBlock++;
+        if (positionInBlock >= (int)currentDocIDs.size()) {
+            currentBlockIdx++;
+            if (currentBlockIdx < startBlock + (numPostings + BLOCK_SIZE - 1) / BLOCK_SIZE) {
+                decompressBlock(currentBlockIdx);
+            } else {
+                finished = true;
+            }
+        }
+    }
+};
+
+// BM25 score
+double calculateBM25(int tf, int docLength, int df, int N) {
+    double idf = log((N - df + 0.5) / (df + 0.5));
+    double tfComponent = (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * (docLength / avgDocLength)));
+    return idf * tfComponent;
+}
+
+
+bool getDocumentText(int docID, string& text) {
+    if (docID < 0 || docID >= (int)docStoreIndex.size()) {
+        return false;
+    }
+
+    ifstream docStoreFile("index/documents.dat", ios::binary);
+    if (!docStoreFile.is_open()) return false;
+
+    long long offset = docStoreIndex[docID].first;
+    int length = docStoreIndex[docID].second;
+
+    text.resize(length);
+    docStoreFile.seekg(offset);
+    docStoreFile.read(&text[0], length);
+    docStoreFile.close();
+    return true;
+}
+
+string generateSnippet(const string& text, const vector<string>& queryTerms, bool forCli) {
+    const int SNIPPET_WORDS = 30;
+    unordered_set<string> qTerms(queryTerms.begin(), queryTerms.end());
+
+    vector<string> docWords;
+    string word;
+    for (char c : text) {
+        if (isspace(c)) {
+            if (!word.empty()) {
+                docWords.push_back(word);
+                word.clear();
+            }
+        } else {
+            word += c;
+        }
+    }
+    if (!word.empty()) docWords.push_back(word);
+    
+    if (docWords.empty()) return "";
+
+    int bestWindowStart = 0;
+    int maxScore = -1;
+
+    for (int i = 0; i <= (int)docWords.size() - SNIPPET_WORDS; ++i) {
+        unordered_set<string> foundTerms;
+        for (int j = 0; j < SNIPPET_WORDS; ++j) {
+            string lowerWord = docWords[i+j];
+            transform(lowerWord.begin(), lowerWord.end(), lowerWord.begin(), ::tolower);
+            lowerWord.erase(remove_if(lowerWord.begin(), lowerWord.end(), ::iswpunct), lowerWord.end());
+            if (qTerms.count(lowerWord)) {
+                foundTerms.insert(lowerWord);
+            }
+        }
+        if ((int)foundTerms.size() > maxScore) {
+            maxScore = foundTerms.size();
+            bestWindowStart = i;
+        }
+    }
+    
+    if (maxScore == 0) {
+        bestWindowStart = 0;
+    }
+
+    stringstream ss;
+    if (bestWindowStart > 0) ss << "... ";
+
+    int end = min((int)docWords.size(), bestWindowStart + SNIPPET_WORDS);
+    for (int i = bestWindowStart; i < end; ++i) {
+        string lowerWord = docWords[i];
+        transform(lowerWord.begin(), lowerWord.end(), lowerWord.begin(), ::tolower);
+        lowerWord.erase(remove_if(lowerWord.begin(), lowerWord.end(), ::iswpunct), lowerWord.end());
+
+        if (qTerms.count(lowerWord)) {
+            if (forCli) ss << "\033[1;31m" << docWords[i] << "\033[0m "; 
+            else ss << "\'" << docWords[i] << "\' ";
+        } else {
+            ss << docWords[i] << " ";
+        }
+    }
+    if (end < (int)docWords.size()) ss << "...";
+
+    return ss.str();
+}
+
+// Disjunctive query
+vector<pair<int, double>> processDisjunctiveQuery(ifstream* invFile, const vector<string>& queryTerms) {
+    unordered_map<int, double> docScores;
+    
+    for (const auto& term : queryTerms) {
+        auto it = lexicon.find(term);
+        if (it == lexicon.end()) continue;
+        
+        int df = get<3>(it->second);
+        InvertedList list(invFile, term);
+        
+        list.nextGEQ(0);
+        while (list.hasNext()) {
+            int docID = list.getDocID();
+            int freq = list.getFrequency();
+            int docLen = docLengths.count(docID) ? docLengths[docID] : (int)avgDocLength;
+            
+            double score = calculateBM25(freq, docLen, df, totalDocuments);
+            docScores[docID] += score;
+            
+            list.next();
+        }
+    }
+    
+    vector<pair<int, double>> results;
+    for (const auto& pair : docScores) {
+        results.push_back({pair.first, pair.second});
+    }
+    
+    sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+    
+    return results;
+}
+
+// Conjunctive query
+vector<pair<int, double>> processConjunctiveQuery(ifstream* invFile, const vector<string>& queryTerms) {
+    if (queryTerms.empty()) return {};
+    
+    struct TermInfo {
+        string term;
+        int df;
+        InvertedList* list;
+    };
+    
+    vector<TermInfo> termInfos;
+    
+    for (const auto& term : queryTerms) {
+        auto it = lexicon.find(term);
+        if (it == lexicon.end()) {
+            for (auto& t : termInfos) delete t.list;
+            return {};
+        }
+        
+        int df = get<3>(it->second);
+        termInfos.push_back({term, df, new InvertedList(invFile, term)});
+    }
+    
+    sort(termInfos.begin(), termInfos.end(),
+         [](const TermInfo& a, const TermInfo& b) { return a.df < b.df; });
+    
+    vector<InvertedList*> lists;
+    vector<int> dfs;
+    for (auto& t : termInfos) {
+        lists.push_back(t.list);
+        dfs.push_back(t.df);
+    }
+
+    unordered_map<int, double> docScores;
+    
+    lists[0]->nextGEQ(0);
+    while (lists[0]->hasNext()) {
+        int docID = lists[0]->getDocID();
+        bool inAll = true;
+        vector<int> freqs = {lists[0]->getFrequency()};
+        
+        for (size_t i = 1; i < lists.size(); i++) {
+            lists[i]->nextGEQ(docID);
+            if (!lists[i]->hasNext() || lists[i]->getDocID() != docID) {
+                inAll = false;
+                break;
+            }
+            freqs.push_back(lists[i]->getFrequency());
+        }
+        
+        if (inAll) {
+            int docLen = docLengths.count(docID) ? docLengths[docID] : (int)avgDocLength;
+            double totalScore = 0.0;
+            for (size_t i = 0; i < lists.size(); i++) {
+                totalScore += calculateBM25(freqs[i], docLen, dfs[i], totalDocuments);
+            }
+            docScores[docID] = totalScore;
+        }
+        
+        lists[0]->next();
+    }
+    
+    for (auto* list : lists) delete list;
+    
+    vector<pair<int, double>> results;
+    for (const auto& p : docScores) results.emplace_back(p.first, p.second);
+    
+    sort(results.begin(), results.end(),
+         [](const auto& a, const auto& b) { return a.second > b.second; });
+    
+    return results;
+}
+
+// Load index
+bool loadIndex() {
+    ifstream lexFile("index/lexicon.txt");
+    if (!lexFile.is_open()) return false;
+    
+    string line;
+    while (getline(lexFile, line)) {
+        stringstream ss(line);
+        string term;
+        long long offset;
+        int startBlock, numPostings, df;
+        ss >> term >> offset >> startBlock >> numPostings >> df;
+        lexicon[term] = make_tuple(offset, startBlock, numPostings, df);
+    }
+    lexFile.close();
+    
+    ifstream metaFile("index/metadata.bin", ios::binary);
+    if (!metaFile.is_open()) return false;
+    
+    int numBlocks;
+    metaFile.read(reinterpret_cast<char*>(&numBlocks), sizeof(int));
+    
+    lastDocIDs.resize(numBlocks);
+    docIDSizes.resize(numBlocks);
+    freqSizes.resize(numBlocks);
+    
+    metaFile.read(reinterpret_cast<char*>(lastDocIDs.data()), numBlocks * sizeof(int));
+    metaFile.read(reinterpret_cast<char*>(docIDSizes.data()), numBlocks * sizeof(int));
+    metaFile.read(reinterpret_cast<char*>(freqSizes.data()), numBlocks * sizeof(int));
+    metaFile.close();
+    
+    ifstream docLenFile("index/doc_lengths.txt");
+    if (docLenFile.is_open()) {
+        while (getline(docLenFile, line)) {
+            stringstream ss(line);
+            int docID, length;
+            ss >> docID >> length;
+            docLengths[docID] = length;
+            avgDocLength += length;
+        }
+        totalDocuments = docLengths.size();
+        docLenFile.close();
+        if (totalDocuments > 0) avgDocLength /= totalDocuments;
+    }
+    
+    ifstream docIdxFile("index/documents.idx", ios::binary);
+    if(docIdxFile.is_open()) {
+        long long offset;
+        int length;
+        while(docIdxFile.read(reinterpret_cast<char*>(&offset), sizeof(long long)) && 
+              docIdxFile.read(reinterpret_cast<char*>(&length), sizeof(int))) {
+            docStoreIndex.push_back({offset, length});
+        }
+        docIdxFile.close();
+    } else {
+        return false;
+    }
+    
+    return true;
+}
+
+// CLI
+void handleCli() {
+    cout << "Search engine ready. Type 'quit' to exit.\n";
+    cout << "Prefix queries with 'AND:' for conjunctive, 'OR:' for disjunctive (default).\n\n";
+    
+    ifstream invFile("index/inverted_index.bin", ios::binary);
+    if (!invFile.is_open()) {
+        cerr << "error opening inverted index\n";
+        return;
+    }
+    
+    string line;
+    while (true) {
+        cout << "Query> ";
+        if (!getline(cin, line)) break;
+        
+        line.erase(0, line.find_first_not_of(" \t\n\r"));
+        line.erase(line.find_last_not_of(" \t\n\r") + 1);
+        
+        if (line.empty()) continue;
+        if (line == "quit" || line == "exit") break;
+        
+        bool conjunctive = false;
+        string query = line;
+        
+        if (line.size() >= 4 && line.substr(0, 4) == "AND:") {
+            conjunctive = true;
+            query = line.substr(4);
+        } else if (line.size() >= 3 && line.substr(0, 3) == "OR:") {
+            query = line.substr(3);
+        }
+        
+        vector<string> queryTerms = tokenize(query);
+        if (queryTerms.empty()) continue;
+        
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        vector<pair<int, double>> scoredDocs;
+        if (conjunctive) {
+            scoredDocs = processConjunctiveQuery(&invFile, queryTerms);
+        } else {
+            scoredDocs = processDisjunctiveQuery(&invFile, queryTerms);
+        }
+        
+        vector<SearchResult> results;
+        for(int i = 0; i < min(10, (int)scoredDocs.size()); ++i) {
+            string docText;
+            string snippet = "Snippet not available.";
+            if (getDocumentText(scoredDocs[i].first, docText)) {
+                snippet = generateSnippet(docText, queryTerms, true);
+            }
+            results.push_back({scoredDocs[i].first, scoredDocs[i].second, snippet});
+        }
+
+        auto end_time = chrono::high_resolution_clock::now();
+        double elapsed_ms = chrono::duration<double, milli>(end_time - start_time).count();
+        
+        cout << "\nTop " << results.size() << " results:\n";
+        for (int i = 0; i < (int)results.size(); i++) {
+            cout << (i + 1) << ". DocID: " << results[i].docID 
+                 << " (score: " << results[i].score << ")\n";
+            cout << "Snippet: " << results[i].snippet << "\n";
+        }
+        cout << "--------------------------------------------------\n";
+        cout << "Total found: " << scoredDocs.size() << " documents\n";
+        cout << "Search time: " << elapsed_ms << " ms\n\n";
+    }
+    
+    invFile.close();
+}
+
+// Server
+void handleServer(int port) {
+    crow::SimpleApp app;
+    
+    CROW_ROUTE(app, "/search")
+    ([&](const crow::request& req) {
+        auto start_time = chrono::high_resolution_clock::now();
+        
+        string query = req.url_params.get("q") ? req.url_params.get("q") : "";
+        string mode = req.url_params.get("mode") ? req.url_params.get("mode") : "or";
+        int limit = req.url_params.get("limit") ? stoi(req.url_params.get("limit")) : 10;
+        
+        if (query.empty()) {
+            return crow::response(400, "{\"error\": \"Missing query parameter 'q'\"}");
+        }
+        if (mode != "and" && mode != "or") {
+            return crow::response(400, "{\"error\": \"Invalid mode. Use 'and' or 'or'\"}");
+        }
+        limit = max(1, min(100, limit));
+        
+        vector<string> queryTerms = tokenize(query);
+        if (queryTerms.empty()) {
+            return crow::response(400, "{\"error\": \"No valid query terms found\"}");
+        }
+        
+        vector<pair<int, double>> scoredDocs;
+        
+        {
+            lock_guard<mutex> lock(fileMutex);
+            ifstream invFile("index/inverted_index.bin", ios::binary);
+            if (!invFile.is_open()) {
+                return crow::response(500, "{\"error\": \"Failed to open inverted index\"}");
+            }
+            if (mode == "and") {
+                scoredDocs = processConjunctiveQuery(&invFile, queryTerms);
+            } else {
+                scoredDocs = processDisjunctiveQuery(&invFile, queryTerms);
+            }
+            invFile.close();
+        }
+        
+        vector<SearchResult> results;
+        for(int i = 0; i < min(limit, (int)scoredDocs.size()); ++i) {
+            string docText;
+            string snippet = "Snippet not available.";
+            if (getDocumentText(scoredDocs[i].first, docText)) {
+                snippet = generateSnippet(docText, queryTerms, false);
+            }
+            results.push_back({scoredDocs[i].first, scoredDocs[i].second, snippet});
+        }
+        
+        auto end_time = chrono::high_resolution_clock::now();
+        double elapsed_ms = chrono::duration<double, milli>(end_time - start_time).count();
+        
+        crow::json::wvalue response;
+        response["query"] = query;
+        response["total_results"] = (int)scoredDocs.size();
+        response["returned_results"] = (int)results.size();
+        response["search_time"] = elapsed_ms;
+        
+        crow::json::wvalue::list result_list;
+        for (const auto& res : results) {
+            crow::json::wvalue r;
+            r["docId"] = res.docID;
+            r["score"] = res.score;
+            r["snippet"] = res.snippet;
+            result_list.push_back(std::move(r));
+        }
+        response["results"] = std::move(result_list);
+        
+        return crow::response(response);
+    });
+    
+    app.port(port).multithreaded().run();
+}
+
+int main(int argc, char* argv[]) {
+    cout << "Loading index..." << endl;
+    if (!loadIndex()) {
+        cerr << "Error loading index files! Make sure all index files are present in the 'index/' directory." << endl;
+        return 1;
+    }
+    cout << "Index loaded successfully." << endl;
+    
+    if (argc == 1) {
+        handleCli(); 
+    } else if (argc >= 2 && strcmp(argv[1], "--server") == 0) {
+        int port = 8080; 
+        if (argc >= 3) {
+            try {
+                port = stoi(argv[2]);
+            } catch (...) {
+                port = 8080;
+            }
+        }
+        handleServer(port);
+    } else {
+        cerr << "Usage: " << argv[0] << " [--server PORT]\n";
+        return 1;
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\end{document}
