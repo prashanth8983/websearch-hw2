@@ -64,7 +64,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-
     // Buffer for postings
     vector<tuple<string, int, int>> postingBuffer;
     const size_t MAX_BUFFER_SIZE = 10000000;
@@ -77,6 +76,9 @@ int main(int argc, char* argv[]) {
     ofstream pageTable("index/page_table.txt");
     ofstream docLengthFile("index/doc_lengths.txt");
 
+    ofstream docStoreFile("index/documents.dat", ios::binary);
+    ofstream docStoreIndexFile("index/documents.idx", ios::binary);
+
     cerr << "Starting indexing...\n";
 
     while (getline(file, line)) {
@@ -85,6 +87,12 @@ int main(int argc, char* argv[]) {
         
         if (!getline(ss, pid_str, '\t')) continue;
         if (!getline(ss, passage)) continue;
+
+        long long offset = docStoreFile.tellp();
+        int length = passage.length();
+        docStoreFile.write(passage.c_str(), length);
+        docStoreIndexFile.write(reinterpret_cast<const char*>(&offset), sizeof(long long));
+        docStoreIndexFile.write(reinterpret_cast<const char*>(&length), sizeof(int));
 
         // Tokenize passage
         vector<string> tokens = tokenize(passage);
@@ -125,8 +133,9 @@ int main(int argc, char* argv[]) {
     file.close();
     pageTable.close();
     docLengthFile.close();
-
-    // Flush remaining postings
+    docStoreFile.close();
+    docStoreIndexFile.close();
+   
     if (!postingBuffer.empty()) {
         sort(postingBuffer.begin(), postingBuffer.end());
         write_file(postingBuffer, runNumber++);
