@@ -57,6 +57,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+
+    // Create directories
+    system("mkdir -p partial");
+    system("mkdir -p index");
+
     string inputFilename = argv[1];
     ifstream file(inputFilename);
     if (!file.is_open()) {
