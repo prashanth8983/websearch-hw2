@@ -7,10 +7,12 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdlib>
+#include <cwctype>
+#include <locale>
 
 using namespace std;
 
-// Tokenize a passage into terms
+//Tokenize sentences into terms
 vector<string> tokenize(const string& s) {
     vector<string> tokens;
     string token;
@@ -29,7 +31,7 @@ vector<string> tokenize(const string& s) {
 }
 
 // Write sorted postings to a binary run file
-void writeRun(const vector<tuple<string, int, int>>& postings, int runNumber) {
+void write_file(const vector<tuple<string, int, int>>& postings, int runNumber) {
     string filename = "partial/run_" + to_string(runNumber) + ".bin";
     ofstream out(filename, ios::binary);
     
@@ -46,9 +48,7 @@ void writeRun(const vector<tuple<string, int, int>>& postings, int runNumber) {
     
     out.close();
     
-    // Console log when partial index is saved
-    cerr << "Saved partial index: run_" << runNumber << ".bin (" 
-         << postings.size() << " postings)\n";
+    cerr << "Saved partial index: run_" << runNumber << ".bin ("<< postings.size() << " postings)\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -64,13 +64,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Create directories
-    system("mkdir -p partial");
-    system("mkdir -p index");
 
     // Buffer for postings
     vector<tuple<string, int, int>> postingBuffer;
-    const size_t MAX_BUFFER_SIZE = 10000000; // 10M postings
+    const size_t MAX_BUFFER_SIZE = 10000000;
     
     int docID = 0;
     int runNumber = 0;
@@ -120,7 +117,7 @@ int main(int argc, char* argv[]) {
         // Flush buffer when full
         if (postingBuffer.size() >= MAX_BUFFER_SIZE) {
             sort(postingBuffer.begin(), postingBuffer.end());
-            writeRun(postingBuffer, runNumber++);
+            write_file(postingBuffer, runNumber++);
             postingBuffer.clear();
         }
     }
@@ -132,7 +129,7 @@ int main(int argc, char* argv[]) {
     // Flush remaining postings
     if (!postingBuffer.empty()) {
         sort(postingBuffer.begin(), postingBuffer.end());
-        writeRun(postingBuffer, runNumber++);
+        write_file(postingBuffer, runNumber++);
     }
 
     // Write metadata

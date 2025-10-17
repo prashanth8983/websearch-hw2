@@ -30,8 +30,7 @@ void varbyte_encode(int num, vector<unsigned char>& output) {
     output.push_back(num & 0x7F);
 }
 
-void writeBlock(ofstream& invFile, const vector<int>& docIDs, const vector<int>& freqs,
-                vector<int>& lastDocIDs, vector<int>& docIDSizes, vector<int>& freqSizes) {
+void write_block(ofstream& invFile, const vector<int>& docIDs, const vector<int>& freqs,vector<int>& lastDocIDs, vector<int>& docIDSizes, vector<int>& freqSizes) {
     
     // Delta encode docIDs
     vector<int> deltas;
@@ -64,8 +63,8 @@ void writeBlock(ofstream& invFile, const vector<int>& docIDs, const vector<int>&
     freqSizes.push_back(freqSize);
 }
 
-// Read next posting from binary run file
-bool readNextPosting(ifstream& file, string& term, int& docID, int& freq) {
+// Read next items from binary run file
+bool read_next(ifstream& file, string& term, int& docID, int& freq) {
     // Read term length
     int termLen;
     if (!file.read(reinterpret_cast<char*>(&termLen), sizeof(int))) {
@@ -120,7 +119,7 @@ int main(int argc, char* argv[]) {
     vector<int> currentFreqs(numRuns);
     
     for (int i = 0; i < numRuns; i++) {
-        if (readNextPosting(runFiles[i], currentTerms[i], currentDocIDs[i], currentFreqs[i])) {
+        if (read_next(runFiles[i], currentTerms[i], currentDocIDs[i], currentFreqs[i])) {
             pq.push({currentTerms[i], currentDocIDs[i], currentFreqs[i], i});
         }
     }
@@ -146,7 +145,7 @@ int main(int argc, char* argv[]) {
         // New term - finish previous
         if (!currentTerm.empty() && entry.term != currentTerm) {
             if (!termDocIDs.empty()) {
-                writeBlock(invFile, termDocIDs, termFreqs, 
+                write_block(invFile, termDocIDs, termFreqs, 
                           allLastDocIDs, allDocIDSizes, allFreqSizes);
             }
             
@@ -182,7 +181,7 @@ int main(int argc, char* argv[]) {
         
         // Write block when full
         if ((int)termDocIDs.size() == BLOCK_SIZE) {
-            writeBlock(invFile, termDocIDs, termFreqs,
+            write_block(invFile, termDocIDs, termFreqs,
                       allLastDocIDs, allDocIDSizes, allFreqSizes);
             termDocIDs.clear();
             termFreqs.clear();
@@ -190,7 +189,7 @@ int main(int argc, char* argv[]) {
         
         // Read next from same file
         int fileIdx = entry.fileIndex;
-        if (readNextPosting(runFiles[fileIdx], currentTerms[fileIdx], 
+        if (read_next(runFiles[fileIdx], currentTerms[fileIdx], 
                            currentDocIDs[fileIdx], currentFreqs[fileIdx])) {
             pq.push({currentTerms[fileIdx], currentDocIDs[fileIdx], 
                     currentFreqs[fileIdx], fileIdx});
@@ -200,7 +199,7 @@ int main(int argc, char* argv[]) {
     // Process last term
     if (!currentTerm.empty()) {
         if (!termDocIDs.empty()) {
-            writeBlock(invFile, termDocIDs, termFreqs,
+            write_block(invFile, termDocIDs, termFreqs,
                       allLastDocIDs, allDocIDSizes, allFreqSizes);
         }
         
@@ -222,12 +221,9 @@ int main(int argc, char* argv[]) {
     
     int numBlocks = allLastDocIDs.size();
     metaFile.write(reinterpret_cast<const char*>(&numBlocks), sizeof(int));
-    metaFile.write(reinterpret_cast<const char*>(allLastDocIDs.data()), 
-                   numBlocks * sizeof(int));
-    metaFile.write(reinterpret_cast<const char*>(allDocIDSizes.data()), 
-                   numBlocks * sizeof(int));
-    metaFile.write(reinterpret_cast<const char*>(allFreqSizes.data()), 
-                   numBlocks * sizeof(int));
+    metaFile.write(reinterpret_cast<const char*>(allLastDocIDs.data()), numBlocks * sizeof(int));
+    metaFile.write(reinterpret_cast<const char*>(allDocIDSizes.data()), numBlocks * sizeof(int));
+    metaFile.write(reinterpret_cast<const char*>(allFreqSizes.data()),  numBlocks * sizeof(int));
     metaFile.close();
     
     // Write stats
