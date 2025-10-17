@@ -247,29 +247,48 @@ vector<pair<int, double>> processDisjunctiveQuery(ifstream& invFile, const vecto
 vector<pair<int, double>> processConjunctiveQuery(ifstream& invFile, const vector<string>& queryTerms) {
     if (queryTerms.empty()) return {};
     
-    vector<InvertedList*> lists;
-    vector<int> dfs;
+    struct TermInfo {
+        string term;
+        int df;
+        InvertedList* list;
+    };
     
+    vector<TermInfo> termInfos;
+    
+    // Step 1: Build InvertedLists and store df (document frequency)
     for (const auto& term : queryTerms) {
         auto it = lexicon.find(term);
         if (it == lexicon.end()) {
-            for (auto* list : lists) delete list;
+            for (auto& t : termInfos) delete t.list;
             return {};
         }
         
-        dfs.push_back(get<3>(it->second));
-        lists.push_back(new InvertedList(invFile, term));
+        int df = get<3>(it->second); // document frequency from lexicon
+        termInfos.push_back({term, df, new InvertedList(invFile, term)});
     }
     
+    // Step 2: Sort by ascending df (shortest posting list first)
+    sort(termInfos.begin(), termInfos.end(),
+         [](const TermInfo& a, const TermInfo& b) { return a.df < b.df; });
+    
+    // Step 3: Extract pointers and dfs in sorted order
+    vector<InvertedList*> lists;
+    vector<int> dfs;
+    for (auto& t : termInfos) {
+        lists.push_back(t.list);
+        dfs.push_back(t.df);
+    }
+
     unordered_map<int, double> docScores;
     
+    // Step 4: Begin traversal from the *shortest* list
     lists[0]->nextGEQ(0);
     while (lists[0]->hasNext()) {
         int docID = lists[0]->getDocID();
         bool inAll = true;
-        
         vector<int> freqs = {lists[0]->getFrequency()};
         
+        // Step 5: Intersect with the rest of the lists
         for (size_t i = 1; i < lists.size(); i++) {
             lists[i]->nextGEQ(docID);
             if (!lists[i]->hasNext() || lists[i]->getDocID() != docID) {
@@ -279,31 +298,31 @@ vector<pair<int, double>> processConjunctiveQuery(ifstream& invFile, const vecto
             freqs.push_back(lists[i]->getFrequency());
         }
         
+        // Step 6: Score documents that appear in all lists
         if (inAll) {
             int docLen = docLengths.count(docID) ? docLengths[docID] : (int)avgDocLength;
             double totalScore = 0.0;
-            for (size_t i = 0; i < queryTerms.size(); i++) {
+            for (size_t i = 0; i < lists.size(); i++) {
                 totalScore += calculateBM25(freqs[i], docLen, dfs[i], totalDocuments);
             }
             docScores[docID] = totalScore;
         }
         
-        lists[0]->next();
+        lists[0]->next(); // move shortest list forward
     }
     
+    // Step 7: Cleanup and sort results
     for (auto* list : lists) delete list;
     
     vector<pair<int, double>> results;
-    for (const auto& pair : docScores) {
-        results.push_back({pair.first, pair.second});
-    }
+    for (const auto& p : docScores) results.emplace_back(p.first, p.second);
     
-    sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
+    sort(results.begin(), results.end(),
+         [](const auto& a, const auto& b) { return a.second > b.second; });
     
     return results;
 }
+
 
 // Load index
 bool loadIndex() {

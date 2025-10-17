@@ -110,7 +110,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Priority queue for k-way merge
+    // Min heap - Priority queue for k-way merge
     priority_queue<TermEntry, vector<TermEntry>, greater<TermEntry>> pq;
     
     // Initialize
